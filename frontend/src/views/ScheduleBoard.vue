@@ -734,7 +734,7 @@ async function savePublish() {
     await publishWashVersion({ changeNote: publishNote.value, createdBy: '工艺员', cells: editCells.value })
     ElMessage.success('新版本已发布：之后的新方案采用新口径，旧方案仍按保存时版本复算')
     publishDialog.value = false
-    const r = await scheduleContext(); ctx.value = r
+    const r = await scheduleContext(); ctx.value = r.data
     await loadMatrix()
   } catch (e) { ElMessage.error(e.message) }
 }

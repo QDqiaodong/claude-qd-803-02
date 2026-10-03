@@ -144,6 +144,50 @@ assert pending.get('C-2407')=='PENDING'
 print("  [PASS] 排程后排产布车仍为 PENDING（未回写布车状态、未开执行单）")
 EOF
 
+echo "== K. 计算期间改输入：同一作业补跑，最终结果与最新输入一致 =="
+python3 - <<'EOF'
+import json,time,urllib.request
+from datetime import datetime,timedelta
+B="http://127.0.0.1:8399/api/schedule"
+def req(path, body=None, method=None):
+    data=json.dumps(body).encode() if body is not None else None
+    r=urllib.request.Request(B+path, data=data,
+        headers={"Content-Type":"application/json"}, method=method)
+    return json.load(urllib.request.urlopen(r))
+def FMT(dt): return dt.strftime("%Y-%m-%d %H:%M")
+
+# 先把 C-2501（id=16）还原为普通单，避免受前序步骤影响
+req("/carts/16", {"dueTime":"2026-10-04 20:00","rushFlag":0}, "PATCH")
+# 锚点对齐当前整点；最新交期 = 锚点后 3 小时（够染但不宽裕，逼急单抢最早缸位）
+anchor=datetime.now().replace(minute=0,second=0,microsecond=0)
+due=FMT(anchor+timedelta(hours=3))
+job=req("/plans/generate", {"planName":"连续修改-合并","createdBy":"验收",
+                            "anchorTime":FMT(anchor),"horizonHours":120})['data']
+jid=job['jobId']
+# 立刻连续改动两次（普通→急单、交期再提前）；无论作业处于排队还是计算中，都必须被最终结果采纳
+req("/carts/16", {"dueTime":FMT(anchor+timedelta(hours=6)),"rushFlag":1}, "PATCH")
+req("/carts/16", {"dueTime":due,"rushFlag":1}, "PATCH")
+j=None
+for _ in range(40):
+    j=req("/jobs/%s"%jid)['data']
+    if j is None: break
+    if j['status'] in ('DONE','FAILED'): break
+    time.sleep(0.25)
+assert j and j['status']=='DONE', j
+plan=req("/plans/%s"%j['planId'])['data']
+cart=[a for a in plan['assignments'] if a['cartCode']=='C-2501'][0]
+T=lambda s: datetime.fromisoformat(str(s))
+# 最终方案必须反映“最新一次输入”：急单 + 最近交期，且按时完成（lateMinutes==0）
+assert cart['startTime'] and cart['lateMinutes']==0, (cart['startTime'],cart['lateMinutes'],cart['reasonText'])
+assert T(cart['endTime']) <= datetime.strptime(due,"%Y-%m-%d %H:%M"), (cart['endTime'],due)
+# 同时不能比同方案其他普通车更晚（急单不被省清洗压后）
+normal=[T(a['startTime']) for a in plan['assignments']
+        if a['startTime'] and a['resultType']=='SCHEDULED' and a['cartCode']!='C-2501']
+assert T(cart['startTime']) <= min(normal), (cart['startTime'],min(normal))
+print("  [PASS] 作业运行期间的连续修改被补跑采纳：C-2501 急单 %s 起、%s 前完成且不晚于普通车批次" % (
+    cart['startTime'],due))
+EOF
+
 echo
 echo "结果: PASS=$PASS FAIL=$FAIL"
 [ $FAIL -eq 0 ] || exit 1

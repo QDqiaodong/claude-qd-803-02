@@ -48,8 +48,10 @@ public class SchedulePlanService {
     private final ScheduleInputAssembler assembler;
     private final ScheduleTxBean txBean;
 
-    /** 进行中的重算作业：scopeKey（输入指纹）-> job，相同指纹直接复用，连续修改只重算一次最新口径 */
+    /** 进行中的重算作业：scopeKey（视窗/锚点）-> job，相同 scope 直接复用，连续修改只重算一次最新口径 */
     private final Map<String, Job> runningJobs = new ConcurrentHashMap<>();
+    /** 每个 scope 一把锁：提交/置脏/收尾三段状态转换必须原子，避免“新作业刚入表又被旧作业收尾移除”的竞态 */
+    private final Map<String, Object> scopeLocks = new ConcurrentHashMap<>();
     /** 已完成作业短期保留，防止“计算快于首次轮询”时页面查不到结果 */
     private final Map<Long, Job> finishedJobs = new ConcurrentHashMap<>();
     private final AtomicLong jobSeq = new AtomicLong(1);
@@ -88,8 +90,14 @@ public class SchedulePlanService {
     // ----------------------------------------------------------------
 
     /**
-     * 发起重算。相同输入指纹的并发/连续请求合并到同一个作业（去重）；
-     * 前端只认最新 jobId，轮询拿到的最终结果必然对应最新输入。
+     * 发起重算。
+     * <p>合并语义：
+     * <ul>
+     *   <li>相同 scope（视窗/锚点）已有作业在跑：直接复用同一 jobId，不重复计算；</li>
+     *   <li>但作业读数之后数据又变了（连续改交期/锁定段），作业结束时会自动用最新输入再跑一轮，
+     *       直到某一轮跑完后没有新的修改 —— 保证页面轮询到的最终方案必然对应最新输入。</li>
+     * </ul>
+     * 重算池本身是单线程，所以每个 scope 只保留一个槽位即可。
      */
     public JobSubmit submitGenerate(ScheduleGenerateRequest request) {
         int horizonHours = request.getHorizonHours() == null || request.getHorizonHours() <= 0
@@ -98,24 +106,39 @@ public class SchedulePlanService {
                 ? LocalDateTime.now().withMinute(0).withSecond(0).withNano(0)
                 : parseTime(request.getAnchorTime());
         String scopeKey = "live|" + horizonHours + "|" + anchor;
+        Object lock = scopeLocks.computeIfAbsent(scopeKey, k -> new Object());
 
-        Job[] created = new Job[1];
-        Job job = runningJobs.computeIfAbsent(scopeKey, k -> {
-            Job j = new Job();
-            j.jobId = jobSeq.getAndIncrement();
-            j.scopeKey = k;
-            j.planName = request.getPlanName();
-            j.createdBy = request.getCreatedBy();
-            j.status = "RUNNING";
-            j.submitTime = LocalDateTime.now();
-            created[0] = j;
-            recomputePool.submit(() -> runGenerate(j, horizonHours, anchor));
-            return j;
-        });
+        Job job;
+        boolean created;
+        synchronized (lock) {
+            Job existing = runningJobs.get(scopeKey);
+            if (existing != null) {
+                // 作业在跑或排队中：标记输入已变，由当前作业收尾时自动补跑，本次不产生新作业
+                existing.dirty = true;
+                job = existing;
+                created = false;
+            } else {
+                Job j = new Job();
+                j.jobId = jobSeq.getAndIncrement();
+                j.scopeKey = scopeKey;
+                j.planName = request.getPlanName();
+                j.createdBy = request.getCreatedBy();
+                j.status = "RUNNING";
+                j.submitTime = LocalDateTime.now();
+                j.dirty = false;
+                runningJobs.put(scopeKey, j);
+                job = j;
+                created = true;
+            }
+        }
+        // 线程池提交放到锁外，避免极端情况下提交阻塞拖住请求线程
+        if (created) {
+            recomputePool.submit(() -> runGenerateLoop(job, horizonHours, anchor));
+        }
         JobSubmit submit = new JobSubmit();
         submit.jobId = job.jobId;
         submit.status = job.status;
-        submit.merged = created[0] == null; // 已有同指纹作业：本次请求被合并，不产生重复计算
+        submit.merged = !created; // 已有同 scope 作业：本次请求被合并，不产生重复计算
         return submit;
     }
 
@@ -133,23 +156,61 @@ public class SchedulePlanService {
         return finished;
     }
 
-    /** 后台线程执行：只读取数 → 引擎计算 → 独立事务落库（均经跨 Bean 调用，事务生效）。 */
-    void runGenerate(Job job, int horizonHours, LocalDateTime anchor) {
+    /**
+     * 后台线程执行：只读取数 → 引擎计算 → 独立事务落库（均经跨 Bean 调用，事务生效）。
+     * 每轮开跑前重新读取全量现场；跑完若期间又有修改（dirty），不清脏再补跑一轮，
+     * 这样连续修改交期/锁定段时，中间的无效计算被合并，且最后一个方案一定基于最新输入。
+     */
+    void runGenerateLoop(Job job, int horizonHours, LocalDateTime anchor) {
+        String scopeKey = job.scopeKey;
+        boolean finishedCleanly = false;
         try {
-            GenerateBundle bundle = txBean.loadLiveBundle(horizonHours, anchor);
-            ScheduleEngine engine = new ScheduleEngine(bundle.input.getFamilies(), bundle.input.getWashCells());
-            ScheduleOutput output = engine.solve(bundle.input);
-            SchedulePlan plan = txBean.persistPlan(job.planName, job.createdBy, bundle, output, "NOW");
-            job.planId = plan.getId();
-            job.planCode = plan.getPlanCode();
-            job.status = "DONE";
+            while (true) {
+                job.dirty = false;
+                job.status = "RUNNING";
+                // 每轮重新读数：本轮计算期间发生的修改会把 dirty 重新置为 true
+                GenerateBundle bundle = txBean.loadLiveBundle(horizonHours, anchor);
+                ScheduleEngine engine = new ScheduleEngine(bundle.input.getFamilies(), bundle.input.getWashCells());
+                ScheduleOutput output = engine.solve(bundle.input);
+                SchedulePlan plan = txBean.persistPlan(job.planName, job.createdBy, bundle, output, "NOW");
+                job.planId = plan.getId();
+                job.planCode = plan.getPlanCode();
+                job.error = null;
+
+                Object lock = scopeLocks.computeIfAbsent(scopeKey, k -> new Object());
+                synchronized (lock) {
+                    // 锁内复查：提交方置脏与作业收尾在同一把锁上排队，不会漏掉“最后一刻的修改”
+                    if (job.dirty) {
+                        // 输入在本轮期间变化：中间方案保留在库里，下一轮按最新输入补算
+                        job.status = "RECOMPUTING";
+                        continue;
+                    }
+                    job.status = "DONE";
+                    job.finishTime = LocalDateTime.now();
+                    // 带身份移除，双保险避免误删后来者（提交都在同一把锁上，正常不会发生）
+                    runningJobs.remove(scopeKey, job);
+                    finishedJobs.put(job.jobId, job);
+                    finishedCleanly = true;
+                    return;
+                }
+            }
         } catch (Exception e) {
             job.status = "FAILED";
             job.error = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
         } finally {
-            job.finishTime = LocalDateTime.now();
-            runningJobs.remove(job.scopeKey);
-            finishedJobs.put(job.jobId, job);
+            if (!finishedCleanly) {
+                // 异常路径收尾（成功路径已在锁内完成，不重复处理）
+                Object lock = scopeLocks.get(scopeKey);
+                if (lock != null) {
+                    synchronized (lock) {
+                        runningJobs.remove(scopeKey, job);
+                    }
+                } else {
+                    runningJobs.remove(scopeKey, job);
+                }
+                job.finishTime = LocalDateTime.now();
+                finishedJobs.put(job.jobId, job);
+            }
         }
     }
 
@@ -286,12 +347,15 @@ public class SchedulePlanService {
         public String scopeKey;
         public String planName;
         public String createdBy;
+        /** RUNNING / RECOMPUTING（输入已变，正在按最新输入补跑）/ DONE / FAILED */
         public volatile String status;
         public volatile Long planId;
         public volatile String planCode;
         public volatile String error;
         public volatile LocalDateTime submitTime;
         public volatile LocalDateTime finishTime;
+        /** 计算期间是否又有新修改（Tomcat 线程置位、单线程重算池读取，故用 volatile） */
+        volatile boolean dirty;
     }
 
     public static class JobSubmit {

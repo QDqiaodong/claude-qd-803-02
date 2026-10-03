@@ -13,7 +13,7 @@ H2_VER=2.2.224
 # 1) 编译主代码到独立目录（不污染 target、不加 test 依赖）
 mvn -s settings.xml -B -q dependency:build-classpath -Dmdep.outputFile=/tmp/mill-cp.txt
 mkdir -p "$BUILD"
-javac -encoding UTF-8 -cp "$(cat /tmp/mill-cp.txt)" -d "$BUILD" $(find src/main/java -name '*.java')
+javac -parameters -encoding UTF-8 -cp "$(cat /tmp/mill-cp.txt)" -d "$BUILD" $(find src/main/java -name '*.java')
 
 # 2) 取 H2 jar（仅 harness 用，不进 pom / docker 构建）
 mkdir -p /tmp/mill-h2-lib
@@ -23,7 +23,7 @@ if [ ! -f "$H2_JAR" ]; then
 fi
 
 # 3) 编译 harness 启动类 + 引擎夹具
-javac -encoding UTF-8 -cp "$BUILD:$(cat /tmp/mill-cp.txt):$H2_JAR" -d "$BUILD" \
+javac -parameters -encoding UTF-8 -cp "$BUILD:$(cat /tmp/mill-cp.txt):$H2_JAR" -d "$BUILD" \
   "$HARNESS/H2TestApplication.java" "$HARNESS/EngineHarness.java"
 
 # 4) 纯引擎验收（无 Spring、无数据库）
