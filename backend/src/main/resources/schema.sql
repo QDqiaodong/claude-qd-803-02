@@ -368,6 +368,8 @@ CREATE TABLE schedule_plan_assignment (
     vat_code          VARCHAR(32)  NULL,
     start_time        DATETIME     NULL COMMENT '染色开始（清洗结束后）',
     end_time          DATETIME     NULL COMMENT '染色结束',
+    wash_start_time   DATETIME     NULL COMMENT '入缸前清洗实际开始（可因维护跨空档）',
+    wash_end_time     DATETIME     NULL COMMENT '入缸前清洗实际结束',
     wash_before_min   INT          NULL COMMENT '入缸前清洗时长',
     wash_before_cost  DECIMAL(10,2) NULL,
     wash_from_cart_id BIGINT       NULL COMMENT '上一缸（清洗来源）布车',

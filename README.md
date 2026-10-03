@@ -43,8 +43,8 @@
 - 开缸执行单：创建时同时核对布种/色号、已发布最新版本、匹配曲线、染缸容量和机台温度上限；待确认单按资料指纹复核，配方/曲线/排缸变化自动失效；下达用布车行级锁 + `uk_issued_cart(active_cart_id)` 保证同车仅一张生效，并在同一事务内锁定快照、更新布车/染缸和 Redis 参数。
 - 异常验收开关：后端设置 `EXECUTION_FAIL_AFTER_PARAMS=true` 可在 Redis 参数写入后模拟失败，用于确认执行单/布车/染缸回滚、Redis 参数恢复。
 - 换色排程：排程引擎（`engine` 包）是无副作用、可重放的纯算法（硬约束=机型/容量/时段/清洗接续/维护/锁定，评分=急单交期→逾期→空档→清洗成本）；
-  输入经 `ScheduleInputAssembler` 从现场数据或历史快照装配；方案异步生成走单线程重算池 + 同输入作业合并，
-  结果存 `schedule_plan`/`schedule_plan_assignment`，并带生成列唯一索引 `uk_plan_reference` 保证同表仅一个参考方案。
+  输入经 `ScheduleInputAssembler` 从现场数据或历史快照装配；方案异步生成走单线程重算池，同 scope 并发作业合并、执行中变更只保留最新排队作业，
+  结果存 `schedule_plan`/`schedule_plan_assignment`，并带生成列唯一索引 `uk_plan_reference` 保证同表仅一个参考方案。锁定段的入缸清洗按最终时间轴预留并可跨维护前空档回填实际清洗起止时间。
 
 ## 前端导航
 

@@ -84,14 +84,15 @@ public class ScheduleEngine {
             addEntry(timelines, b.getVatId(), TimelineEntry.block(b));
         }
 
-        // 固定段先入输出（在制 + 锁定绑布车的段），并统计锁定段清洗（上一缸接续）
+        // 固定段先入输出（在制 + 锁定绑布车的段）。锁定前清洗在所有动态排程完成后统一回填，
+        // 这样才能看到锁定前最后一辆自动排入布车的色族，避免动态车挤占承诺清洗口。
         for (EBlock b : in.getRunningBlocks()) {
-            out.getResults().add(fixedResult(b, in, matrix));
+            out.getResults().add(fixedResult(b, in));
             out.setFixedCount(out.getFixedCount() + 1);
         }
         for (EBlock b : in.getLocks()) {
             if (b.getCartId() != null) {
-                out.getResults().add(lockedResult(b, in, matrix, timelines.get(b.getVatId())));
+                out.getResults().add(lockedResult(b, in));
                 out.setFixedCount(out.getFixedCount() + 1);
             }
         }
@@ -264,6 +265,9 @@ public class ScheduleEngine {
             out.setExcludedCount(out.getExcludedCount() + 1);
         }
 
+        // 所有动态车落子后，再按最终时间轴回填每段的真实入缸清洗。锁定段的清洗口也在此处保留，
+        // 可识别维护跨段、动态插入和承诺段前空间不足等具体情况。
+        postprocessWash(out, timelines, in);
         summarize(out, timelines, in);
         return out;
     }
@@ -277,6 +281,7 @@ public class ScheduleEngine {
         Placement p = new Placement();
         int duration = cart.getProcessMinutes();
         LocalDateTime cursor = anchor;
+        List<String> blockers = new ArrayList<>();
 
         for (int i = 0; i < axis.size(); i++) {
             TimelineEntry e = axis.get(i);
@@ -284,23 +289,20 @@ public class ScheduleEngine {
                 continue; // 已过去的段
             }
             if (e.start.isAfter(cursor)) {
-                // 空档 cursor ~ e.start；色族接续取最近一个带色族的已结束段（跨过维护段）
                 TimelineEntry colorBase = latestColoredBefore(axis, i, e.start);
-                Lookup wash = washAfter(colorBase, cart.getFamilyId());
-                long gapMin = ChronoUnit.MINUTES.between(cursor, e.start);
-                if (gapMin >= wash.minutes() + duration) {
-                    Placement ok = new Placement();
-                    ok.feasible = true;
-                    // 紧贴下一固定段倒排以最小空档，但不得早于 cursor + wash
-                    ok.start = e.start.minusMinutes(duration);
-                    LocalDateTime earliest = cursor.plusMinutes(wash.minutes());
-                    if (ok.start.isBefore(earliest)) {
-                        ok.start = earliest;
-                    }
-                    if (!ok.start.plusMinutes(duration).isAfter(e.start)) {
-                        fillWash(ok, wash, colorBase);
+                Lookup incoming = washAfter(colorBase, cart.getFamilyId());
+                LocalDateTime earliestStart = cursor.plusMinutes(incoming.minutes());
+                if (!earliestStart.isAfter(e.start.minusMinutes(duration))) {
+                    int outgoing = outgoingWashNeeded(axis, i, e, cart.getFamilyId());
+                    long gapMin = ChronoUnit.MINUTES.between(cursor, e.start);
+                    if (gapMin >= incoming.minutes() + duration + outgoing) {
+                        Placement ok = new Placement();
+                        ok.feasible = true;
+                        ok.start = earliestStart;
+                        fillWash(ok, incoming, colorBase);
                         return ok;
                     }
+                    blockers.add(describeGapBlock(e, incoming.minutes(), duration, outgoing));
                 }
             }
             if (e.end.isAfter(cursor)) {
@@ -322,8 +324,54 @@ public class ScheduleEngine {
         p.feasible = false;
         p.rejectCode = "HORIZON";
         p.rejectText = "最早可用 " + fmt(cursor) + "，加清洗 " + wash.minutes()
-                + " 分 + 染色 " + duration + " 分后超出视窗 " + fmt(horizonEnd);
+                + " 分 + 染色 " + duration + " 分后超出视窗 " + fmt(horizonEnd)
+                + (blockers.isEmpty() ? "" : "；前方受限：" + String.join("；", blockers));
         return p;
+    }
+
+    /**
+     * 动态段落在维护后又紧跟固定染色/锁定段时，必须在维护前为“维护后接续染色”预留出口清洗。
+     * 动态段之间不预留：后续车会作为新车重找入口清洗，不会沿用本车结束后的时间点。
+     */
+    private int outgoingWashNeeded(List<TimelineEntry> axis, int blockIndex, TimelineEntry block, Long cartFamilyId) {
+        if ("MAINTENANCE".equals(block.kind)) {
+            TimelineEntry after = nextColoredAtOrAfter(axis, blockIndex, block.end);
+            // 维护后若紧跟另一辆已自动排入车，后续车自己会重算入口清洗；只对锁定/在制固定段提前预留。
+            if (after == null || after.familyId == null || "PLACED".equals(after.kind)) {
+                return 0;
+            }
+            return matrix.lookup(cartFamilyId, after.familyId).minutes();
+        }
+        if (block.familyId != null) {
+            if ("LOCK".equals(block.kind) || "RUNNING".equals(block.kind)) {
+                return matrix.lookup(cartFamilyId, block.familyId).minutes();
+            }
+        }
+        return 0;
+    }
+
+    private TimelineEntry nextColoredAtOrAfter(List<TimelineEntry> axis, int startIndex, LocalDateTime time) {
+        for (int i = startIndex; i < axis.size(); i++) {
+            TimelineEntry e = axis.get(i);
+            if (!e.start.isBefore(time) && e.familyId != null) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private String describeGapBlock(TimelineEntry block, int incomingWash, int duration, int outgoingWash) {
+        String name = switch (block.kind) {
+            case "MAINTENANCE" -> "维护窗口";
+            case "LOCK" -> block.familyId == null ? "人工封缸段" : "人工锁定染色段";
+            case "RUNNING" -> "在制固定段";
+            default -> "已排入段";
+        };
+        int required = incomingWash + duration + outgoingWash;
+        return name + " " + fmt(block.start) + " ~ " + fmt(block.end)
+                + " 前空档不足（需入口清洗 " + incomingWash + " + 染色 " + duration
+                + (outgoingWash > 0 ? " + 接续清洗 " + outgoingWash : "")
+                + " = " + required + " 分钟）";
     }
 
     /** 截止 beforeExclusive 索引之前、end ≤ beforeTime 的最近一个带色族段（维护段无家族，被跨过）。 */
@@ -375,6 +423,8 @@ public class ScheduleEngine {
         r.setVatCode(vat.getCode());
         r.setStart(p.start);
         r.setEnd(p.start.plusMinutes(cart.getProcessMinutes()));
+        r.setWashStartTime(p.start.minusMinutes(p.washMin));
+        r.setWashEndTime(p.start);
         r.setWashBeforeMin(p.washMin);
         r.setWashBeforeCost(p.washCost);
         r.setWashFromCartId(p.washFromCartId);
@@ -417,7 +467,7 @@ public class ScheduleEngine {
         r.setReason(String.join("；", pts));
     }
 
-    private EResult fixedResult(EBlock b, ScheduleInput in, WashMatrix matrix) {
+    private EResult fixedResult(EBlock b, ScheduleInput in) {
         EResult r = new EResult();
         r.setResultType("FIXED");
         r.setCartId(b.getCartId());
@@ -433,7 +483,7 @@ public class ScheduleEngine {
         return r;
     }
 
-    private EResult lockedResult(EBlock b, ScheduleInput in, WashMatrix matrix, List<TimelineEntry> axis) {
+    private EResult lockedResult(EBlock b, ScheduleInput in) {
         EResult r = new EResult();
         r.setResultType("FIXED");
         r.setCartId(b.getCartId());
@@ -454,6 +504,117 @@ public class ScheduleEngine {
                 .map(EFamily::getCode).orElse(null);
     }
 
+    /**
+     * 动态排程全部结束后，按最终时间轴重新计算每个染色段的入缸前清洗。
+     * 对人工锁定段也只回填清洗信息，不移动锁定染色时段；空间不足时输出资料/固定段冲突警告。
+     */
+    private void postprocessWash(ScheduleOutput out, Map<Long, List<TimelineEntry>> timelines, ScheduleInput in) {
+        Map<String, EResult> resultByCartAndStart = new HashMap<>();
+        for (EResult r : out.getResults()) {
+            if (r.getCartId() != null && r.getStart() != null) {
+                resultByCartAndStart.put(r.getCartId() + "@" + r.getStart(), r);
+            }
+        }
+        Map<Long, ECart> cartById = in.getCarts().stream().collect(java.util.stream.Collectors.toMap(
+                ECart::getId, c -> c, (a, b) -> a));
+
+        for (List<TimelineEntry> axis : timelines.values()) {
+            axis.sort(Comparator.comparing((TimelineEntry e) -> e.start).thenComparing(e -> e.end));
+            for (int i = 0; i < axis.size(); i++) {
+                TimelineEntry target = axis.get(i);
+                if (target.familyId == null || target.cartId == null
+                        || (!"PLACED".equals(target.kind) && !"LOCK".equals(target.kind))) {
+                    continue;
+                }
+                EResult r = resultByCartAndStart.get(target.cartId + "@" + target.start);
+                if (r == null) {
+                    continue;
+                }
+                TimelineEntry base = latestColoredBefore(axis, i, target.start);
+                LocalDateTime baseEnd = base == null || base.end.isBefore(in.getAnchor())
+                        ? in.getAnchor() : base.end;
+                Lookup wash = washAfter(base, target.familyId);
+                Interval interval = findWashInterval(axis, i, target.start, in.getAnchor(),
+                        baseEnd, wash.minutes());
+                r.setWashBeforeMin(wash.minutes());
+                r.setWashBeforeCost(wash.cost());
+                r.setWashFromCartId(base == null ? null : base.cartId);
+                r.setSwitchType(wash.switchType());
+                r.setLateMinutes((int) lateMinutes(r.getEnd(), cartById.get(target.cartId) == null
+                        ? null : cartById.get(target.cartId).getDueTime()));
+                if (interval != null) {
+                    r.setWashStartTime(interval.start());
+                    r.setWashEndTime(interval.end());
+                    if (r.isLocked()) {
+                        String washText = "锁定前清洗已保留：" + wash.note() + "（" + fmt(interval.start())
+                                + " ~ " + fmt(interval.end()) + "，" + wash.minutes() + " 分钟 / "
+                                + wash.cost().stripTrailingZeros().toPlainString() + " 元）";
+                        replaceWashReason(r, washText);
+                    }
+                } else {
+                    r.setWashStartTime(null);
+                    r.setWashEndTime(null);
+                    String conflict = "人工锁定段 " + r.getCartCode() + "（" + r.getVatCode() + " "
+                            + fmt(r.getStart()) + "）前没有连续 " + wash.minutes()
+                            + " 分钟可用于「" + wash.note() + "」，锁定段与维护/占用资料冲突；请调整锁定或维护时段";
+                    if (r.isLocked()) {
+                        replaceWashReason(r, conflict + "；本次未移动锁定段");
+                        out.getWarnings().add(conflict);
+                    }
+                }
+            }
+        }
+    }
+
+    private void replaceWashReason(EResult r, String washText) {
+        java.util.List<String> pts = new ArrayList<>();
+        pts.add(washText);
+        pts.addAll(r.getReasonPoints().stream()
+                .filter(t -> t == null || (!t.contains("清洗") && !t.contains("空缸中性起步")))
+                .toList());
+        r.getReasonPoints().clear();
+        r.getReasonPoints().addAll(pts);
+        r.setReason(String.join("；", pts));
+    }
+
+    /**
+     * 在 targetStart 之前、notBefore 之后寻找一个不占用染色/维护段的清洗口。
+     * 维护段被跳过；倒序找最近一个可用口，保证锁定前即使隔着维护也能预留清洗。
+     */
+    private Interval findWashInterval(List<TimelineEntry> axis, int targetIndex,
+                                      LocalDateTime targetStart, LocalDateTime anchor,
+                                      LocalDateTime notBefore, int minutes) {
+        LocalDateTime candidateEnd = targetStart;
+        LocalDateTime lower = notBefore.isBefore(anchor) ? anchor : notBefore;
+        for (int i = targetIndex - 1; i >= 0; i--) {
+            TimelineEntry e = axis.get(i);
+            if (e.kind == null) {
+                continue;
+            }
+            if (!e.end.isAfter(lower) || !e.start.isBefore(candidateEnd)) {
+                continue;
+            }
+            if (minutesBetweenSafe(e.end, candidateEnd) >= minutes) {
+                LocalDateTime start = candidateEnd.minusMinutes(minutes);
+                if (!start.isBefore(e.end) && !start.isBefore(lower)) {
+                    return new Interval(start, candidateEnd);
+                }
+            }
+            candidateEnd = e.start;
+        }
+        if (minutesBetweenSafe(lower, candidateEnd) >= minutes) {
+            return new Interval(candidateEnd.minusMinutes(minutes), candidateEnd);
+        }
+        return null;
+    }
+
+    private long minutesBetweenSafe(LocalDateTime start, LocalDateTime end) {
+        return start.isAfter(end) ? 0 : ChronoUnit.MINUTES.between(start, end);
+    }
+
+    private record Interval(LocalDateTime start, LocalDateTime end) {
+    }
+
     // ------------------------------------------------------------------
     // 汇总
     // ------------------------------------------------------------------
@@ -464,17 +625,18 @@ public class ScheduleEngine {
         int lateMinSum = 0;
         int idleSum = 0;
         for (EResult r : out.getResults()) {
-            if (r.getWashBeforeMin() != null) {
+            boolean effectiveWash = "SCHEDULED".equals(r.getResultType()) || r.getWashStartTime() != null;
+            if (effectiveWash && r.getWashBeforeMin() != null) {
                 washMin += r.getWashBeforeMin();
             }
-            if (r.getWashBeforeCost() != null) {
+            if (effectiveWash && r.getWashBeforeCost() != null) {
                 washCost = washCost.add(r.getWashBeforeCost());
             }
             if (r.getLateMinutes() > 0) {
                 late++;
                 lateMinSum += r.getLateMinutes();
             }
-            if ("SCHEDULED".equals(r.getResultType())) {
+            if ("SCHEDULED".equals(r.getResultType()) || "DELAYED".equals(r.getResultType())) {
                 idleSum += scheduledIdle(timelines.get(r.getVatId()), r, in.getAnchor());
             }
         }
@@ -488,8 +650,11 @@ public class ScheduleEngine {
     /** 该车染色开始前、同缸上一占用段（或锚点）之后的空档分钟数（已扣清洗）。 */
     private int scheduledIdle(List<TimelineEntry> axis, EResult r, LocalDateTime anchor) {
         LocalDateTime prevEnd = anchor;
+        LocalDateTime washStart = r.getWashStartTime() == null
+                ? r.getStart().minusMinutes(r.getWashBeforeMin() == null ? 0 : r.getWashBeforeMin())
+                : r.getWashStartTime();
         for (TimelineEntry e : axis) {
-            if (!e.end.isAfter(r.getStart()) && e.end.isAfter(prevEnd)) {
+            if (!e.end.isAfter(washStart) && e.end.isAfter(prevEnd)) {
                 prevEnd = e.end;
             }
         }

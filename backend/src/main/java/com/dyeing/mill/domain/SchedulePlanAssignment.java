@@ -33,7 +33,7 @@ public class SchedulePlanAssignment {
     @Column(name = "cart_code", nullable = false, length = 32)
     private String cartCode;
 
-    /** SCHEDULED / EXCLUDED / FIXED */
+    /** SCHEDULED 自动排入（lateMinutes>0 表示延后逾期）/ EXCLUDED 资料或容量等原因排除 / FIXED 固定段 */
     @Column(name = "result_type", nullable = false, length = 12)
     private String resultType;
 
@@ -49,6 +49,13 @@ public class SchedulePlanAssignment {
 
     @Column(name = "end_time")
     private LocalDateTime endTime;
+
+    /** 入缸前清洗实际开始/结束时间（锁定前清洗可跨过维护前空档，不一定紧挨染色） */
+    @Column(name = "wash_start_time")
+    private LocalDateTime washStartTime;
+
+    @Column(name = "wash_end_time")
+    private LocalDateTime washEndTime;
 
     /** 入缸前清洗时长（与上一缸色族之间的矩阵取值） */
     @Column(name = "wash_before_min")

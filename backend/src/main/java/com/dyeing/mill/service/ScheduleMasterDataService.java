@@ -1,5 +1,6 @@
 package com.dyeing.mill.service;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.List;
@@ -11,13 +12,17 @@ import com.dyeing.mill.common.BizException;
 import com.dyeing.mill.domain.ClothCart;
 import com.dyeing.mill.domain.DyeVat;
 import com.dyeing.mill.domain.MaintenanceWindow;
+import com.dyeing.mill.domain.Recipe;
 import com.dyeing.mill.domain.ScheduleLock;
 import com.dyeing.mill.dto.CartSchedulePatchRequest;
 import com.dyeing.mill.dto.MaintenanceWindowRequest;
 import com.dyeing.mill.dto.ScheduleLockRequest;
 import com.dyeing.mill.repository.ClothCartRepository;
+import com.dyeing.mill.repository.ColorFamilyMapRepository;
 import com.dyeing.mill.repository.DyeVatRepository;
+import com.dyeing.mill.repository.FabricMachineRepository;
 import com.dyeing.mill.repository.MaintenanceWindowRepository;
+import com.dyeing.mill.repository.RecipeRepository;
 import com.dyeing.mill.repository.ScheduleLockRepository;
 
 /**
@@ -32,15 +37,24 @@ public class ScheduleMasterDataService {
     private final DyeVatRepository vatRepository;
     private final MaintenanceWindowRepository maintenanceRepository;
     private final ScheduleLockRepository lockRepository;
+    private final ColorFamilyMapRepository familyMapRepository;
+    private final FabricMachineRepository fabricMachineRepository;
+    private final RecipeRepository recipeRepository;
 
     public ScheduleMasterDataService(ClothCartRepository cartRepository,
                                      DyeVatRepository vatRepository,
                                      MaintenanceWindowRepository maintenanceRepository,
-                                     ScheduleLockRepository lockRepository) {
+                                     ScheduleLockRepository lockRepository,
+                                     ColorFamilyMapRepository familyMapRepository,
+                                     FabricMachineRepository fabricMachineRepository,
+                                     RecipeRepository recipeRepository) {
         this.cartRepository = cartRepository;
         this.vatRepository = vatRepository;
         this.maintenanceRepository = maintenanceRepository;
         this.lockRepository = lockRepository;
+        this.familyMapRepository = familyMapRepository;
+        this.fabricMachineRepository = fabricMachineRepository;
+        this.recipeRepository = recipeRepository;
     }
 
     // ---------------- 布车交期 / 急单（仅排程字段） ----------------
@@ -84,6 +98,7 @@ public class ScheduleMasterDataService {
         if (request.getReason() == null || request.getReason().isBlank()) {
             throw new BizException("维护原因不能为空");
         }
+        assertNoLockOverlap(vat.getId(), vat.getVatCode(), start, end);
         MaintenanceWindow w = new MaintenanceWindow();
         w.setVatId(vat.getId());
         w.setVatCode(vat.getVatCode());
@@ -121,6 +136,9 @@ public class ScheduleMasterDataService {
         if (request.getLockReason() == null || request.getLockReason().isBlank()) {
             throw new BizException("锁定原因（承诺依据）不能为空");
         }
+        if (end.isBefore(java.time.LocalDateTime.now())) {
+            throw new BizException("不能锁定已经结束的历史时段");
+        }
         // 同缸与其他锁定段互斥
         List<ScheduleLock> overlap = lockRepository.findOverlap(vat.getId(), start, end);
         if (!overlap.isEmpty()) {
@@ -128,10 +146,21 @@ public class ScheduleMasterDataService {
             throw new BizException("染缸 " + vat.getVatCode() + " 在该时段已存在锁定段 "
                     + c.getStartTime() + " ~ " + c.getEndTime() + "（" + c.getLockReason() + "）");
         }
+        if (!maintenanceRepository.findOverlap(vat.getId(), start, end).isEmpty()) {
+            throw new BizException("染缸 " + vat.getVatCode() + " 在该时段已有维护安排，不能再承诺锁定缸位");
+        }
+        assertNoRunningOverlap(vat.getId(), vat.getVatCode(), start, end);
         String cartCode = null;
         if (request.getCartId() != null) {
             ClothCart cart = cartRepository.findById(request.getCartId())
                     .orElseThrow(() -> new BizException("锁定的布车不存在或已报废：id=" + request.getCartId()));
+            if (!"PENDING".equals(cart.getStatus()) && !"REWORK".equals(cart.getStatus())) {
+                throw new BizException("只能锁定待排产或返修布车；" + cart.getCartCode() + " 当前为 " + cart.getStatus());
+            }
+            if (familyMapRepository.findByColorCode(cart.getColorCode()).isEmpty()) {
+                throw new BizException("布车 " + cart.getCartCode() + " 的色号未配置颜色族，无法预留锁定前清洗");
+            }
+            assertLockCartCompatible(cart, vat);
             cartCode = cart.getCartCode();
         }
         ScheduleLock lock = new ScheduleLock();
@@ -153,6 +182,48 @@ public class ScheduleMasterDataService {
                 .orElseThrow(() -> new BizException("锁定段不存在：id=" + id));
         lock.setDeleted(1);
         lockRepository.save(lock);
+    }
+
+    private void assertNoLockOverlap(Long vatId, String vatCode, LocalDateTime start, LocalDateTime end) {
+        List<ScheduleLock> overlap = lockRepository.findOverlap(vatId, start, end);
+        if (!overlap.isEmpty()) {
+            ScheduleLock l = overlap.get(0);
+            throw new BizException("染缸 " + vatCode + " 在该维护时段已有承诺锁定段 "
+                    + l.getStartTime() + " ~ " + l.getEndTime() + "（" + l.getLockReason() + "），请先解除或改期");
+        }
+    }
+
+    private void assertNoRunningOverlap(Long vatId, String vatCode, LocalDateTime start, LocalDateTime end) {
+        List<ClothCart> running = cartRepository.findOverlap(vatId, -1L, start, end);
+        if (!running.isEmpty()) {
+            ClothCart c = running.get(0);
+            throw new BizException("染缸 " + vatCode + " 在该时段已有在制布车 " + c.getCartCode()
+                    + "（" + c.getDyeStartTime() + " ~ " + c.getDyeEndTime() + "）");
+        }
+    }
+
+    private void assertLockCartCompatible(ClothCart cart, DyeVat vat) {
+        boolean machineFit = fabricMachineRepository
+                .existsByFabricTypeAndMachineType(cart.getFabricType(), vat.getMachineType());
+        if (!machineFit) {
+            throw new BizException("布车 " + cart.getCartCode() + " 的布种 " + cart.getFabricType()
+                    + " 不能使用 " + vat.getVatCode() + " 的机型 " + vat.getMachineType());
+        }
+        boolean recipeReady = recipeRepository.findAll().stream()
+                .anyMatch(r -> "RELEASED".equals(r.getStatus())
+                        && r.getFabricType().equals(cart.getFabricType())
+                        && r.getColorCode().equals(cart.getColorCode())
+                        && r.getTotalOwf() != null
+                        && r.getTotalOwf().compareTo(new BigDecimal("100.000")) == 0);
+        if (!recipeReady) {
+            throw new BizException("布车 " + cart.getCartCode() + " 没有 owf=100% 的已发布配方，不能承诺锁定");
+        }
+        BigDecimal weight = cart.getMeters() == null ? BigDecimal.ZERO
+                : cart.getMeters().multiply(ScheduleInputAssembler.METERS_TO_KG);
+        if (vat.getCapacityKg() == null || vat.getCapacityKg().compareTo(weight) < 0) {
+            throw new BizException("布车 " + cart.getCartCode() + " 折算 " + weight.stripTrailingZeros().toPlainString()
+                    + "kg，超过 " + vat.getVatCode() + " 容量 " + vat.getCapacityKg() + "kg，不能承诺锁定");
+        }
     }
 
     private DyeVat requireVat(Long vatId) {

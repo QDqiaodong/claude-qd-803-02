@@ -79,10 +79,10 @@ public class ScheduleContextService {
         List<Recipe> recipes = recipeRepository.findAll();
         List<ProcessCurve> curves = curveRepository.findAll();
 
-        java.util.Set<String> releasedKeys = recipes.stream()
+        java.util.Map<String, Recipe> releasedRecipeMap = recipes.stream()
                 .filter(r -> "RELEASED".equals(r.getStatus()))
-                .map(r -> r.getFabricType() + "|" + r.getColorCode())
-                .collect(java.util.stream.Collectors.toSet());
+                .collect(java.util.stream.Collectors.toMap(
+                        r -> r.getFabricType() + "|" + r.getColorCode(), r -> r, (a, b) -> a));
         java.util.Set<String> curveKeys = curves.stream()
                 .map(c -> c.getFabricType() + "|" + c.getColorCode())
                 .collect(java.util.stream.Collectors.toSet());
@@ -113,7 +113,7 @@ public class ScheduleContextService {
                     }
                     return a.getDueTime().compareTo(b.getDueTime());
                 })
-                .map(c -> cartCard(c, colorToFamily, familyById, fms, vats, releasedKeys, curveKeys))
+                .map(c -> cartCard(c, colorToFamily, familyById, fms, vats, releasedRecipeMap, curveKeys))
                 .toList();
 
         data.put("pendingCarts", pending);
@@ -131,7 +131,7 @@ public class ScheduleContextService {
     private Map<String, Object> cartCard(ClothCart c, Map<String, Long> colorToFamily,
                                          Map<Long, ColorFamily> familyById,
                                          List<FabricMachine> fms, List<DyeVat> vats,
-                                         java.util.Set<String> releasedKeys,
+                                         java.util.Map<String, Recipe> releasedRecipeMap,
                                          java.util.Set<String> curveKeys) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", c.getId());
@@ -157,8 +157,15 @@ public class ScheduleContextService {
         if (familyId == null) {
             issues.add("色号未配置颜色族");
         }
-        if (!releasedKeys.contains(c.getFabricType() + "|" + c.getColorCode())) {
+        String recipeKey = c.getFabricType() + "|" + c.getColorCode();
+        Recipe recipe = releasedRecipeMap.get(recipeKey);
+        if (recipe == null) {
             issues.add("没有已发布配方");
+        } else if (recipe.getItems() == null || recipe.getItems().isEmpty()) {
+            issues.add("已发布配方没有明细");
+        } else if (recipe.getTotalOwf() == null
+                || recipe.getTotalOwf().compareTo(new java.math.BigDecimal("100.000")) != 0) {
+            issues.add("配方染料 owf 合计不是 100%");
         }
         if (!curveKeys.contains(c.getFabricType() + "|" + c.getColorCode())) {
             issues.add("无匹配工艺曲线（将按布种默认时长估算）");

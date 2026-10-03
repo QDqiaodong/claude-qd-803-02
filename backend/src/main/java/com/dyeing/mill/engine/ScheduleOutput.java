@@ -22,9 +22,15 @@ public class ScheduleOutput {
     private BigDecimal totalWashCost = BigDecimal.ZERO;
     private int totalIdleMinutes;
     private int totalLateMinutes;
+    private final List<String> warnings = new ArrayList<>();
+
+    /** 固定锁定段自身资料矛盾等不适合作为布车排除项的硬约束提示。 */
+    public List<String> getWarnings() {
+        return warnings;
+    }
 
     /**
-     * SCHEDULED 自动排入 / EXCLUDED 排除 / FIXED 在制或锁定的固定段。
+     * SCHEDULED 自动排入（lateMinutes>0 表示虽排入但延后逾期）/ EXCLUDED 排除 / FIXED 在制或锁定的固定段。
      */
     @Data
     public static class EResult {
@@ -35,6 +41,8 @@ public class ScheduleOutput {
         private String vatCode;
         private LocalDateTime start;
         private LocalDateTime end;
+        private LocalDateTime washStartTime;
+        private LocalDateTime washEndTime;
         private Integer washBeforeMin;
         private BigDecimal washBeforeCost;
         private Long washFromCartId;

@@ -148,6 +148,8 @@ public class ScheduleTxBean {
         a.setVatCode(r.getVatCode());
         a.setStartTime(r.getStart());
         a.setEndTime(r.getEnd());
+        a.setWashStartTime(r.getWashStartTime());
+        a.setWashEndTime(r.getWashEndTime());
         a.setWashBeforeMin(r.getWashBeforeMin());
         a.setWashBeforeCost(r.getWashBeforeCost());
         a.setWashFromCartId(r.getWashFromCartId());

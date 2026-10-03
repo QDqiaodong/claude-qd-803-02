@@ -78,7 +78,8 @@ public class ScheduleInputAssembler {
                     "维护：" + w.getReason(), "MAINTENANCE", null, null, null));
         }
         for (ScheduleLock l : locks) {
-            Long familyId = l.getCartId() == null ? null : familyOfCart(l.getCartId(), carts, colorToFamily);
+            Long familyId = l.getCartId() == null
+                    ? null : colorToFamily.get(colorCodeOfCart(l.getCartId(), carts));
             in.getLocks().add(block(l.getVatId(), l.getVatCode(), l.getStartTime(), l.getEndTime(),
                     l.getLockReason(), "LOCK", l.getCartId(), l.getCartCode(), familyId));
         }
@@ -242,12 +243,20 @@ public class ScheduleInputAssembler {
 
         String key = cart.getFabricType() + "|" + cart.getColorCode();
         Recipe recipe = releasedIndex.get(key);
-        if (recipe != null) {
-            ec.setRecipeReady(true);
-        } else {
+        if (recipe == null) {
             ec.setRecipeReady(false);
             ec.setRecipeIssue("色号 " + cart.getColorCode() + " 在布种 " + cart.getFabricType()
                     + " 下没有已发布（RELEASED）配方");
+        } else if (recipe.getItems() == null || recipe.getItems().isEmpty()) {
+            ec.setRecipeReady(false);
+            ec.setRecipeIssue("已发布配方 " + recipe.getRecipeCode() + " 没有染料/助剂明细，资料不完整");
+        } else if (recipe.getTotalOwf() == null
+                || recipe.getTotalOwf().compareTo(new java.math.BigDecimal("100.000")) != 0) {
+            ec.setRecipeReady(false);
+            ec.setRecipeIssue("已发布配方 " + recipe.getRecipeCode() + " 的染料 owf 合计为 "
+                    + recipe.getTotalOwf() + "%，不等于 100%");
+        } else {
+            ec.setRecipeReady(true);
         }
         ProcessCurve curve = curveIndex.get(key);
         if (curve != null && curve.getTotalMinutes() != null && curve.getTotalMinutes() > 0) {
@@ -269,9 +278,9 @@ public class ScheduleInputAssembler {
         };
     }
 
-    private Long familyOfCart(Long cartId, List<ClothCart> carts, Map<String, Long> colorToFamily) {
+    private String colorCodeOfCart(Long cartId, List<ClothCart> carts) {
         return carts.stream().filter(c -> Objects.equals(c.getId(), cartId)).findFirst()
-                .map(c -> colorToFamily.get(c.getColorCode())).orElse(null);
+                .map(ClothCart::getColorCode).orElse(null);
     }
 
     private EBlock block(Long vatId, String vatCode, LocalDateTime start, LocalDateTime end, String reason,

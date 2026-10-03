@@ -92,11 +92,20 @@
               <el-tag v-else-if="currentPlan" size="small" type="info">草稿方案</el-tag>
             </div>
             <div class="panel__body">
+              <el-alert
+                v-for="(w, i) in planData?.warnings || []"
+                :key="i"
+                class="plan-warning"
+                type="warning"
+                show-icon
+                :closable="false"
+                :title="w"
+              />
               <ScheduleGantt
-                :vats="ctx.vats || []"
+                :vats="planData?.vats || ctx.vats || []"
                 :assignments="planAssignments"
-                :maintenance="ctx.maintenance || []"
-                :locks="ctx.locks || []"
+                :maintenance="planData?.maintenance || ctx.maintenance || []"
+                :locks="planData?.locks || ctx.locks || []"
                 :start="viewStart"
                 :end="viewEnd"
                 @select="openAssignment"
@@ -137,14 +146,15 @@
 
           <div class="panel">
             <div class="panel__head">
-              <span class="panel__title">排除 / 延后布车原因（{{ excludedRows.length }}）</span>
+              <span class="panel__title">安排 / 延后 / 排除布车原因（{{ issueRows.length }}）</span>
             </div>
             <div class="panel__body">
-              <el-table :data="excludedRows" size="small" border stripe max-height="240">
+              <el-table :data="issueRows" size="small" border stripe max-height="240"
+                        :row-class-name="issueRowClass" @row-click="openAssignment">
                 <el-table-column prop="cartCode" label="布车" width="90" />
-                <el-table-column label="类型" width="90">
+                <el-table-column label="结论" width="90">
                   <template #default="{ row }">
-                    <el-tag size="small" type="danger">排除</el-tag>
+                    <el-tag size="small" :type="issueTag(row.resultType)">{{ issueName(row.resultType) }}</el-tag>
                   </template>
                 </el-table-column>
                 <el-table-column prop="reasonText" label="具体原因（容量 / 机型 / 资料 / 维护窗口 / 视窗）" />
@@ -346,11 +356,14 @@
             {{ selectedAssign.locked ? '人工锁定' : resultName(selectedAssign.resultType) }}
           </el-tag>
         </h4>
-        <div class="explain__row">缸位：<b>{{ selectedAssign.vatCode }}</b>
-          {{ fmtTime(selectedAssign.startTime) }} → {{ fmtTime(selectedAssign.endTime) }}</div>
+        <div class="explain__row">缸位：<b>{{ selectedAssign.vatCode || '—' }}</b>
+          {{ fmtTime(selectedAssign.startTime) }}<template v-if="selectedAssign.endTime"> → {{ fmtTime(selectedAssign.endTime) }}</template></div>
         <div class="explain__row">入缸前清洗：
           <el-tag size="small" :type="switchTag(selectedAssign.switchType)">{{ switchName(selectedAssign.switchType) }}</el-tag>
           {{ selectedAssign.washBeforeMin || 0 }} 分钟 / ¥{{ selectedAssign.washBeforeCost || 0 }}
+          <span v-if="selectedAssign.washStartTime" class="muted">
+            （{{ fmtTime(selectedAssign.washStartTime) }} → {{ fmtTime(selectedAssign.washEndTime) }}）
+          </span>
         </div>
         <div v-if="selectedAssign.lateMinutes > 0" class="explain__row bad">
           预计逾期 {{ (selectedAssign.lateMinutes / 60).toFixed(1) }} 小时
@@ -435,6 +448,7 @@ const currentPlan = ref(null)
 const generating = ref(false)
 let pollTimer = null
 let latestJobToken = 0
+let inputRevision = 0
 
 const matrixData = ref(null)
 const matrixVersionId = ref(null)
@@ -475,10 +489,13 @@ function fmt(d) {
 
 const planAssignments = computed(() => planData.value?.assignments || [])
 const excludedRows = computed(() => planAssignments.value.filter((a) => a.resultType === 'EXCLUDED'))
+const issueRows = computed(() => planAssignments.value
+  .filter((a) => a.resultType === 'EXCLUDED' || (a.resultType === 'SCHEDULED' && (a.lateMinutes || 0) > 0))
+  .sort((a, b) => (b.lateMinutes || 0) - (a.lateMinutes || 0)))
 
 const vatLoadRows = computed(() => {
   const horizonMin = 5 * 24 * 60
-  const map = new Map((ctx.value.vats || []).map((v) => [v.id, {
+  const map = new Map(((planData.value?.vats && planData.value.vats.length ? planData.value.vats : ctx.value.vats) || []).map((v) => [v.id, {
     vatCode: v.vatCode, machineType: v.machineType, capacityKg: v.capacityKg,
     dyeCount: 0, dyeMin: 0, washMin: 0, washCost: 0
   }]))
@@ -529,13 +546,28 @@ async function openPlan(row, silent) {
 }
 
 // ---------------- 异步重算 + 合并轮询 ----------------
-async function onGenerate() {
+async function onGenerate(revision = null) {
   if (generating.value) return
   generating.value = true
   try {
-    const res = await generateSchedule({})
+    const res = await generateSchedule(revision == null ? {} : { clientRevision: revision })
     const token = ++latestJobToken
     if (res.data.merged) ElMessage.info('已有相同输入的重算在进行，已合并等待同一结果')
+    pollJob(res.data.jobId, token)
+  } catch (e) {
+    generating.value = false
+    ElMessage.error(e.message)
+  }
+}
+
+async function queueLatestGenerate(revision) {
+  if (!generating.value) {
+    return onGenerate(revision)
+  }
+  try {
+    const res = await generateSchedule({ clientRevision: revision })
+    const token = ++latestJobToken
+    if (res.data.merged) return // 与当前排队作业同版本，已合并
     pollJob(res.data.jobId, token)
   } catch (e) {
     generating.value = false
@@ -565,7 +597,10 @@ function pollJob(jobId, token) {
         ElMessage.error('重算失败：' + job.error)
         return
       }
-      pollTimer = setTimeout(tick, 800)
+      if (job.status === 'PENDING' || job.status === 'RUNNING') {
+        pollTimer = setTimeout(tick, 800)
+        return
+      }
     } catch (e) {
       generating.value = false
       ElMessage.error(e.message)
@@ -576,6 +611,12 @@ function pollJob(jobId, token) {
 
 // ---------------- 交期/急单（去抖：连续修改只触发一次重算） ----------------
 let dueDirtyTimer = null
+function requestRecomputeSoon() {
+  inputRevision += 1
+  const revision = inputRevision
+  clearTimeout(dueDirtyTimer)
+  dueDirtyTimer = setTimeout(() => queueLatestGenerate(revision), 1200)
+}
 function openDue(cart) {
   dueForm.value = {
     id: cart.id, cartCode: cart.cartCode, colorName: cart.colorName,
@@ -590,9 +631,8 @@ async function saveDue() {
     ElMessage.success('已保存（仅排程字段，布车状态未变）')
     dueDialog.value = false
     await scheduleContext().then((r) => (ctx.value = r.data))
-    // 连续修改合并：1.2 秒内的多次保存只自动重算一次
-    clearTimeout(dueDirtyTimer)
-    dueDirtyTimer = setTimeout(() => { if (!generating.value) onGenerate() }, 1200)
+    // 连续修改合并：1.2 秒内的多次保存只自动重算一次；作业进行中会由后端排队最新版本
+    requestRecomputeSoon()
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -604,13 +644,14 @@ async function saveMaint() {
     maintDialog.value = false
     maintForm.value = {}
     const r = await scheduleContext(); ctx.value = r.data
-    if (!generating.value) onGenerate()
+    requestRecomputeSoon()
   } catch (e) { ElMessage.error(e.message) }
 }
 async function removeMaint(id) {
   await deleteMaintenance(id)
   ElMessage.success('已删除')
   const r = await scheduleContext(); ctx.value = r.data
+  requestRecomputeSoon()
 }
 function openLock() {
   lockForm.value = { vatId: null, cartId: null, startTime: defaultAnchor(2), endTime: defaultAnchor(6), lockReason: '' }
@@ -622,14 +663,14 @@ async function saveLock() {
     ElMessage.success('承诺缸位已锁定')
     lockDialog.value = false
     const r = await scheduleContext(); ctx.value = r.data
-    if (!generating.value) onGenerate()
+    requestRecomputeSoon()
   } catch (e) { ElMessage.error(e.message) }
 }
 async function removeLock(id) {
   await deleteScheduleLock(id)
   ElMessage.success('锁定已解除')
   const r = await scheduleContext(); ctx.value = r.data
-  if (!generating.value) onGenerate()
+  requestRecomputeSoon()
 }
 
 // ---------------- 解释 ----------------
@@ -757,6 +798,9 @@ function depthName(k) { return { SAME: '同色', LIGHT: '浅色', DARK: '深色'
 function switchName(k) { return { SAME: '同色续染', L2D: '浅转深', D2L: '深转浅', SPECIAL: '特殊切换' }[k] || k }
 function switchTag(k) { return { SAME: 'success', L2D: 'primary', D2L: 'warning', SPECIAL: 'danger' }[k] || 'info' }
 function resultName(k) { return { SCHEDULED: '已排入', EXCLUDED: '排除', FIXED: '固定段' }[k] || k }
+function issueName(k) { return k === 'EXCLUDED' ? '排除' : '延后' }
+function issueTag(k) { return k === 'EXCLUDED' ? 'danger' : 'warning' }
+function issueRowClass({ row }) { return row.resultType === 'EXCLUDED' ? 'issue-row--excluded' : 'issue-row--late' }
 
 onMounted(loadAll)
 </script>
@@ -778,6 +822,8 @@ onMounted(loadAll)
 .side__body { max-height: 430px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; }
 .side__body--sm { max-height: 240px; }
 .main-col { display: flex; flex-direction: column; gap: 12px; }
+.plan-warning { margin-bottom: 8px; }
+:deep(.issue-row--late), :deep(.issue-row--excluded) { cursor: pointer; }
 
 .ccard { border: 1px solid var(--mill-line); border-left: 4px solid #b39ddb; border-radius: 8px; padding: 8px 10px; background: #fff; }
 .ccard.is-rush { border-left-color: #c62828; background: #fff8f7; }

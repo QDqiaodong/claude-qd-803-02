@@ -53,16 +53,16 @@ public class WashMatrix {
             return "SPECIAL";
         }
         boolean fromLight = "LIGHT".equals(from.getDepthLevel());
-        boolean toDark = "DARK".equals(to.getDepthLevel());
-        if (fromLight && toDark) {
+        boolean toLight = "LIGHT".equals(to.getDepthLevel());
+        // 同染料族内：同深浅按同色续染；浅→深 / 深→浅按方向区分。
+        if (fromLight && !toLight) {
             return "L2D";
         }
-        if (!fromLight && !toDark) {
-            // DARK -> LIGHT
+        if (!fromLight && toLight) {
             return "D2L";
         }
-        // 同为浅或同为深但不同染料族：按同族切换轻处理
-        return "SAME";
+        // 不同染料族但同为浅/深，沿用显式矩阵；未配置时用特殊切换兜底，避免把换染料误算成同色短洗。
+        return java.util.Objects.equals(from.getDyeClass(), to.getDyeClass()) ? "SAME" : "SPECIAL";
     }
 
     /** 查询结果（时长/成本 + 是否兜底默认） */

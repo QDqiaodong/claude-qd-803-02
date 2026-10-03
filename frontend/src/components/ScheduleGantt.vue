@@ -52,7 +52,7 @@
           <div
             v-if="a.washBeforeMin > 0"
             class="seg seg--wash"
-            :style="segStyle(washStart(a), a.startTime)"
+            :style="segStyle(a.washStartTime || washStart(a), a.washEndTime || a.startTime)"
             :title="`${washName(a.switchType)} ${a.washBeforeMin} 分钟 / ${a.washBeforeCost || 0} 元`"
           >
             <span>洗 {{ (a.washBeforeMin / 60).toFixed(1) }}h</span>

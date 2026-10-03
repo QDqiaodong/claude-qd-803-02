@@ -11,6 +11,8 @@ public class ScheduleGenerateRequest {
     /** 排程视窗长度（小时），默认 120（5 天） */
     private Integer horizonHours;
     private String anchorTime;
+    /** 前端输入版本号：连续修改交期/锁定后递增；缺省表示手动重算/并发去重请求。 */
+    private Long clientRevision;
 
     public String getPlanName() {
         return planName;
@@ -42,5 +44,13 @@ public class ScheduleGenerateRequest {
 
     public void setAnchorTime(String anchorTime) {
         this.anchorTime = anchorTime;
+    }
+
+    public Long getClientRevision() {
+        return clientRevision;
+    }
+
+    public void setClientRevision(Long clientRevision) {
+        this.clientRevision = clientRevision;
     }
 }

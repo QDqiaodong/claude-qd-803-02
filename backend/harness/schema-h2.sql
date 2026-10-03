@@ -303,6 +303,8 @@ CREATE TABLE IF NOT EXISTS schedule_plan_assignment (
     vat_code VARCHAR(32),
     start_time TIMESTAMP,
     end_time TIMESTAMP,
+    wash_start_time TIMESTAMP,
+    wash_end_time TIMESTAMP,
     wash_before_min INT,
     wash_before_cost DECIMAL(10,2),
     wash_from_cart_id BIGINT,
